@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- OTD требует net8.0 и x64 -->
+    <TargetFramework>net8.0</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <OutputType>Library</OutputType>
+    <AssemblyName>GodSpeedOTD</AssemblyName>
+    <RootNamespace>GodSpeedOTD</RootNamespace>
+    <Nullable>disable</Nullable>
+    <!-- Копируем зависимости в output — чтобы OTD не спотыкался о версии -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- NuGet скачает Plugin.dll автоматически при dotnet build -->
+    <PackageReference Include="OpenTabletDriver.Plugin" Version="0.6.6.2" />
+  </ItemGroup>
+
+</Project>

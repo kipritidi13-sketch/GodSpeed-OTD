@@ -1,0 +1,14 @@
+{
+  "Name": "GodSpeedOTD",
+  "Owner": "GodSpeed",
+  "Description": "Adaptive smoothing: EMA, Kalman, Ring, Hybrid",
+  "PluginVersion": "1.2.0",
+  "SupportedDriverVersion": "0.6.0.0",
+  "MaxSupportedDriverVersion": null,
+  "RepositoryUrl": null,
+  "DownloadUrl": null,
+  "CompressionFormat": null,
+  "SHA256": null,
+  "WikiUrl": null,
+  "LicenseIdentifier": "MIT"
+}
