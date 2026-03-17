@@ -1,4 +1,4 @@
-// GodSpeed OTD Plugin v5.5 — dynamic timeout + CPU optimization
+// GodSpeed OTD Plugin v5.5 — dynamic timeout + CPU optimization [PROPER OTD TIMING FIX]
 using System;
 using System.Diagnostics;
 using System.Numerics;
@@ -6,6 +6,7 @@ using OpenTabletDriver.Plugin;
 using OpenTabletDriver.Plugin.Attributes;
 using OpenTabletDriver.Plugin.Output;
 using OpenTabletDriver.Plugin.Tablet;
+using OpenTabletDriver.Plugin.Timing; // Добавлено для HPETDeltaStopwatch
 
 namespace GodSpeedOTD
 {
@@ -63,7 +64,6 @@ namespace GodSpeedOTD
         float _rawX, _rawY;
         bool _hasInput = false;
         bool _newInput = false;
-        bool _penActive = false;
 
         float _fX, _fY;
         float _fastSpd, _baseSpd;
@@ -76,17 +76,9 @@ namespace GodSpeedOTD
         readonly Kalman2D _kalman = new Kalman2D();
         readonly RingBuffer2D _ring = new RingBuffer2D(8);
 
-        static readonly Stopwatch _sw = Stopwatch.StartNew();
-        long _lastTick = -1;
-        long _lastInputTime = 0;
-
+        // ИСПОЛЬЗУЕМ ВЫСОКОТОЧНЫЙ ТАЙМЕР ВМЕСТО ОБЫЧНОГО STOPWATCH
+        private HPETDeltaStopwatch _updateStopwatch = new HPETDeltaStopwatch(true);
         float _predDtAccum = 0f;
-
-        // ── Pen timeout: dynamic based on Hz ─────────────────────
-        // At 1000Hz: 1ms per frame. Allow max 3 frames after pen lift = ~3ms.
-        // At 133Hz:  7.5ms per frame. Allow max 3 frames = ~22ms.
-        // Formula: max(5ms, 3 * 1000/Hz + 2ms buffer)
-        float PenTimeoutMs => Math.Max(5f, 3f * (1000f / Math.Max(Frequency, 1f)) + 2f);
 
         // ── ConsumeState ──────────────────────────────────────────
         protected override void ConsumeState()
@@ -99,14 +91,11 @@ namespace GodSpeedOTD
                     _rawY = tablet.Position.Y;
                     _hasInput = true;
                     _newInput = true;
-                    _penActive = true;
-                    _lastInputTime = _sw.ElapsedMilliseconds;
 
                     int m = Mode;
                     if (m != _lastMode)
                     {
                         _first = true;
-                        _lastTick = -1;
                         _fX = _fY = _fastSpd = _baseSpd = 0f;
                         _vDirX = _vDirY = _predVX = _predVY = 0f;
                         _predDtAccum = 0f;
@@ -124,32 +113,40 @@ namespace GodSpeedOTD
             if (!(State is ITabletReport tablet))
                 return;
 
+            // --- ЖЕЛЕЗНАЯ ПРОВЕРКА OTD: ФИКС ДАБЛ-КЛИКОВ ---
+            // Если перо поднято, сбрасываем фильтры и не эмитим координаты.
+            if (!PenIsInRange())
+            {
+                lock (_lock)
+                {
+                    _first = true;
+                    _hasInput = false;
+                    _fastSpd = _baseSpd = 0f;
+                    _vDirX = _vDirY = _predVX = _predVY = 0f;
+                    _predDtAccum = 0f;
+                    _kalman.Reset();
+                    _ring.Reset();
+                    _updateStopwatch.Restart(); // Сброс таймера, чтобы не накопить огромный dt при возврате пера
+                }
+                return;
+            }
+
+            // --- ИДЕАЛЬНЫЙ РАСЧЕТ ВРЕМЕНИ (dt в миллисекундах) ---
+            float dt = (float)_updateStopwatch.Restart().TotalMilliseconds;
+            // Защита от спайков ЦП: если поток залагал, ограничиваем dt
+            dt = Math.Max(0.1f, Math.Min(50.0f, dt));
+
             float rawX, rawY;
             bool isNew;
-            bool active;
 
             lock (_lock)
             {
-                if (!_hasInput) return;
+                if (!_hasInput) return; // Ждем первые валидные координаты после подноса пера
 
                 rawX = _rawX;
                 rawY = _rawY;
                 isNew = _newInput;
                 _newInput = false;
-
-                // Dynamic timeout — prevents double clicks at high Hz
-                long elapsed = _sw.ElapsedMilliseconds - _lastInputTime;
-                if (elapsed > PenTimeoutMs)
-                {
-                    _penActive = false;
-                }
-                active = _penActive;
-            }
-
-            if (!active)
-            {
-                _lastTick = -1;
-                return;
             }
 
             // CPU optimization: skip interpolation ticks when pen is idle
@@ -160,19 +157,8 @@ namespace GodSpeedOTD
                 float distToRaw = MathF.Sqrt(dx * dx + dy * dy);
                 // If filter is within 0.1 units of target — nothing to interpolate, skip
                 if (distToRaw < 0.1f)
-                    return;
+                    return; // dt уже обновлен через Restart(), можно смело скипать кадр
             }
-
-            long now = _sw.ElapsedTicks;
-            float dt;
-            if (_lastTick < 0)
-                dt = 1f;
-            else
-            {
-                double ms = (now - _lastTick) / (double)Stopwatch.Frequency * 1000.0;
-                dt = (float)Math.Max(0.1, Math.Min(50.0, ms));
-            }
-            _lastTick = now;
 
             _predDtAccum += dt;
 
