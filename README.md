@@ -12,7 +12,7 @@ Advanced cursor smoothing filter with multiple modes.
 
 ## Installation
 1. Download `GodSpeedOTD.dll` from [Releases](../../releases)
-2. Copy to `%appdata%/OpenTabletDriver/Plugins/`
+2. Copy to `%appdata%/OpenTabletDriver/Plugins/` or go to the driver folder, there will be a plugins folder
 3. Restart OpenTabletDriver
 4. Filters → Enable **GodSpeed Filter**
 
