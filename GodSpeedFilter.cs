@@ -1,4 +1,4 @@
-// GodSpeed OTD Plugin v5.4 — фикс даблклика + предикция
+// GodSpeed OTD Plugin v5.5 — dynamic timeout + CPU optimization
 using System;
 using System.Diagnostics;
 using System.Numerics;
@@ -13,7 +13,7 @@ namespace GodSpeedOTD
     public class GodSpeedFilter : AsyncPositionedPipelineElement<IDeviceReport>
     {
         [Property("Hz"), DefaultPropertyValue(1000f)]
-        [ToolTip("Частота интерполяции. 1000 = 1000Hz.")]
+        [ToolTip("Interpolation frequency. 1000 = 1000Hz. Higher = smoother but more CPU.")]
         public new float Frequency
         {
             get => base.Frequency;
@@ -25,40 +25,40 @@ namespace GodSpeedOTD
         public int Mode { get; set; } = 0;
 
         [Property("Smooth Ms"), DefaultPropertyValue(8f)]
-        [ToolTip("Сглаживание в мс. 8-30.")]
+        [ToolTip("Smoothing in ms. 8-30.")]
         public float SmoothMs { get; set; } = 8f;
 
         [Property("Prediction Ms"), DefaultPropertyValue(0f)]
-        [ToolTip("Предикция в мс. 0-5.")]
+        [ToolTip("Prediction in ms. 0-5.")]
         public float PredMs { get; set; } = 0f;
 
         [Property("Deadzone"), DefaultPropertyValue(0f)]
-        [ToolTip("Мёртвая зона в единицах планшета.")]
+        [ToolTip("Dead zone in tablet units.")]
         public float DeadzoneUnits { get; set; } = 0f;
 
         [Property("Aggression"), DefaultPropertyValue(5f)]
-        [ToolTip("Скорость перехода slow→fast (1-10).")]
+        [ToolTip("Speed transition curve slow→fast (1-10).")]
         public float Aggression { get; set; } = 5f;
 
         [Property("Pro Mode"), DefaultPropertyValue(false)]
-        [ToolTip("vFactor^2 кривая для быстрых прыжков.")]
+        [ToolTip("Quadratic speed curve for fast jumps (osu!).")]
         public bool ProMode { get; set; } = false;
 
         [Property("Kalman Q"), DefaultPropertyValue(2f)]
-        [ToolTip("Шум процесса Калмана.")]
+        [ToolTip("Kalman process noise.")]
         public float KalmanQ { get; set; } = 2f;
 
         [Property("Kalman R"), DefaultPropertyValue(4f)]
-        [ToolTip("Шум измерения Калмана.")]
+        [ToolTip("Kalman measurement noise.")]
         public float KalmanR { get; set; } = 4f;
 
         [Property("Ring Size"), DefaultPropertyValue(8)]
-        [ToolTip("Размер кольцевого буфера (режим Ring). 1-64.")]
+        [ToolTip("Ring buffer size (Ring mode). 1-64.")]
         public int RingSize { get; set; } = 8;
 
         public override PipelinePosition Position => PipelinePosition.PreTransform;
 
-        // ── Состояние ─────────────────────────────────────────────
+        // ── State ─────────────────────────────────────────────────
         readonly object _lock = new object();
         float _rawX, _rawY;
         bool _hasInput = false;
@@ -80,8 +80,13 @@ namespace GodSpeedOTD
         long _lastTick = -1;
         long _lastInputTime = 0;
 
-        // Скорость предикции — обновляется только при реальных пакетах
-        float _predDtAccum = 0f; // накопленный dt между реальными пакетами
+        float _predDtAccum = 0f;
+
+        // ── Pen timeout: dynamic based on Hz ─────────────────────
+        // At 1000Hz: 1ms per frame. Allow max 3 frames after pen lift = ~3ms.
+        // At 133Hz:  7.5ms per frame. Allow max 3 frames = ~22ms.
+        // Formula: max(5ms, 3 * 1000/Hz + 2ms buffer)
+        float PenTimeoutMs => Math.Max(5f, 3f * (1000f / Math.Max(Frequency, 1f)) + 2f);
 
         // ── ConsumeState ──────────────────────────────────────────
         protected override void ConsumeState()
@@ -132,9 +137,9 @@ namespace GodSpeedOTD
                 isNew = _newInput;
                 _newInput = false;
 
-                // Таймаут 300ms — не 100ms, чтобы не даблкликало
+                // Dynamic timeout — prevents double clicks at high Hz
                 long elapsed = _sw.ElapsedMilliseconds - _lastInputTime;
-                if (elapsed > 300)
+                if (elapsed > PenTimeoutMs)
                 {
                     _penActive = false;
                 }
@@ -143,10 +148,19 @@ namespace GodSpeedOTD
 
             if (!active)
             {
-                // НЕ ресетим _first — фильтр продолжит с того же места
-                // Только сбрасываем dt чтобы не было гигантского прыжка
                 _lastTick = -1;
                 return;
+            }
+
+            // CPU optimization: skip interpolation ticks when pen is idle
+            // Only skip if: no new input AND filter has already converged to raw position
+            if (!isNew)
+            {
+                float dx = rawX - _fX, dy = rawY - _fY;
+                float distToRaw = MathF.Sqrt(dx * dx + dy * dy);
+                // If filter is within 0.1 units of target — nothing to interpolate, skip
+                if (distToRaw < 0.1f)
+                    return;
             }
 
             long now = _sw.ElapsedTicks;
@@ -160,7 +174,6 @@ namespace GodSpeedOTD
             }
             _lastTick = now;
 
-            // Накапливаем dt между реальными пакетами для расчёта скорости
             _predDtAccum += dt;
 
             if (_first)
@@ -215,7 +228,7 @@ namespace GodSpeedOTD
             float vf;
             if (ProMode)
             {
-                vf = sf;
+                vf = sf * sf; // quadratic curve
                 _vDirX = _vDirY = 0f;
             }
             else
@@ -230,53 +243,32 @@ namespace GodSpeedOTD
                 vf = sf * Math.Max(0f, dot) * Math.Max(0f, Math.Min(1f, dl));
             }
 
-            float adz = DeadzoneUnits * (1f - vf * (ProMode ? 1f : 0.95f));
-            float tx = dist < adz ? _fX : rawX;
-            float ty = dist < adz ? _fY : rawY;
-
-            float ba = SmoothMs > 0.01f ? dt / (SmoothMs + dt) : 1f;
-            float al = ba + (1f - ba) * (ProMode ? vf * vf : vf);
-
-            _fX += (tx - _fX) * al;
-            _fY += (ty - _fY) * al;
-
-            // Скорость предикции — считаем только при РЕАЛЬНОМ новом пакете
-            // Используем накопленный dt между пакетами, а не тиковый dt
-            if (isNew)
+            float adz = DeadzoneUnits * (1f - vf * 0.95f);
+            if (dist < adz)
             {
-                float realDt = Math.Max(_predDtAccum, 0.5f);
-                float rvx = (rawX - _prevRawX) / realDt;
-                float rvy = (rawY - _prevRawY) / realDt;
-                float pa = Math.Min(realDt / (5f + realDt), 0.5f);
-                _predVX += (rvx - _predVX) * pa;
-                _predVY += (rvy - _predVY) * pa;
-                _prevRawX = rawX;
-                _prevRawY = rawY;
-                _predDtAccum = 0f;
+                outX = _fX; outY = _fY;
+                return;
             }
 
-            outX = _fX;
-            outY = _fY;
+            float smoothMs = SmoothMs * (1f - vf);
+            float alpha = smoothMs > 0.01f ? dt / (smoothMs + dt) : 1f;
+            _fX += dx * alpha;
+            _fY += dy * alpha;
+            outX = _fX; outY = _fY;
 
-            // Предикция — PredMs напрямую как смещение в мс
-            // НЕ умножаем на dt, только на скорость
-            float ep = ProMode ? 0f : PredMs * (1f - vf);
-            if (ep > 0.01f)
+            if (PredMs > 0.01f && isNew && _predDtAccum > 0.01f)
             {
-                float px = _fX + _predVX * ep;
-                float py = _fY + _predVY * ep;
-                float s = MathF.Sqrt(_predVX * _predVX + _predVY * _predVY);
-                float md = s * ep * 1.5f + 0.5f;
-                float pdx = px - _fX, pdy = py - _fY;
-                float pd = MathF.Sqrt(pdx * pdx + pdy * pdy);
-                if (pd > md && pd > 0f)
-                {
-                    float sc = md / pd;
-                    px = _fX + pdx * sc;
-                    py = _fY + pdy * sc;
-                }
-                outX = px;
-                outY = py;
+                float vx = (rawX - _prevRawX) / _predDtAccum;
+                float vy = (rawY - _prevRawY) / _predDtAccum;
+                float predScale = 1f - vf * 0.5f;
+                outX = _fX + vx * PredMs * predScale;
+                outY = _fY + vy * PredMs * predScale;
+            }
+
+            if (isNew)
+            {
+                _prevRawX = rawX; _prevRawY = rawY;
+                _predDtAccum = 0f;
             }
         }
 
@@ -284,23 +276,11 @@ namespace GodSpeedOTD
         void RunKalman(float rawX, float rawY, float dt, bool isNew, out float outX, out float outY)
         {
             float kDt = Math.Max(0.5f, Math.Min(20f, dt));
+            float adz = DeadzoneUnits;
 
-            float ks = MathF.Sqrt(
-                _kalman.VelocityX * _kalman.VelocityX +
-                _kalman.VelocityY * _kalman.VelocityY);
+            float tx = rawX, ty = rawY;
 
-            float adz = DeadzoneUnits > 0f
-                ? DeadzoneUnits * (1f - Math.Max(0f, Math.Min(1f, ks * kDt / (DeadzoneUnits + 1f))))
-                : 0f;
-
-            float dx = rawX - _fX, dy = rawY - _fY;
-            float dist = MathF.Sqrt(dx * dx + dy * dy);
-            float mx = dist < adz && adz > 0f ? _fX : rawX;
-            float my = dist < adz && adz > 0f ? _fY : rawY;
-
-            _kalman.Update(mx, my, kDt, out float kX, out float kY);
-
-            if (isNew)
+            if (adz > 0f && isNew)
             {
                 float rawDist = MathF.Sqrt(
                     (rawX - _prevRawX) * (rawX - _prevRawX) +
@@ -310,13 +290,14 @@ namespace GodSpeedOTD
                 if (rawDist < idle)
                 {
                     _kalman.DampVelocity(kDt / (15f + kDt));
-                    kX = _fX + (rawX - _fX) * 0.3f;
-                    kY = _fY + (rawY - _fY) * 0.3f;
+                    tx = _fX + (rawX - _fX) * 0.3f;
+                    ty = _fY + (rawY - _fY) * 0.3f;
                 }
                 _prevRawX = rawX;
                 _prevRawY = rawY;
             }
 
+            _kalman.Update(tx, ty, kDt, out float kX, out float kY);
             _fX = kX; _fY = kY;
             outX = kX; outY = kY;
 
